@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -33,6 +34,9 @@ BOARDS = [
 SEEN_FILE = Path("seen.json")
 KEEP = 300  # 게시판별로 기억해 둘 최근 글 개수
 KST = timezone(timedelta(hours=9))
+RETRIES = 3          # 접속 실패 시 다시 시도하는 횟수
+RETRY_WAIT = 20      # 다시 시도하기 전 기다리는 시간(초)
+ALERT_AFTER = 3      # 연속으로 이 횟수만큼 실패해야 ⚠️ 알림 (10분 주기면 약 30분)
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -66,12 +70,19 @@ def find_date(text: str) -> str:
 
 def fetch_posts(board: dict) -> list[dict]:
     url = board_url(board)
-    r = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; fss-alert/1.0)"},
-        timeout=30,
-    )
-    r.raise_for_status()
+    for attempt in range(RETRIES):
+        try:
+            r = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; fss-alert/1.0)"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(RETRY_WAIT)
     soup = BeautifulSoup(r.text, "html.parser")
 
     posts, ids = [], set()
@@ -122,21 +133,31 @@ def load_seen() -> dict:
 
 def main() -> None:
     seen = load_seen()
-    failed = False
+    fails = seen.setdefault("_fail", {})  # 게시판별 연속 실패 횟수
+
+    def record_failure(name: str, reason: str) -> None:
+        # 잠깐 접속이 안 되는 건 흔하니, 연속으로 여러 번 실패했을 때만 한 번 알림
+        fails[name] = fails.get(name, 0) + 1
+        print(f"{name}: 실패 {fails[name]}회 연속 - {reason}")
+        if fails[name] == ALERT_AFTER:
+            send(f"⚠️ {name}: 약 {ALERT_AFTER * 10}분째 확인이 안 되고 있어요.\n"
+                 f"사이트 점검이나 일시 장애일 수 있어요. 복구되면 다시 알려드릴게요.\n({reason[:200]})")
 
     for board in BOARDS:
         name = board["name"]
         try:
             posts = fetch_posts(board)
         except Exception as e:
-            send(f"⚠️ {name} 확인 실패: {e}")
-            failed = True
+            record_failure(name, f"접속 실패: {type(e).__name__}")
             continue
 
         if not posts:
-            send(f"⚠️ {name}: 글 목록을 찾지 못했어요. 사이트 구조가 바뀌었을 수 있어요.")
-            failed = True
+            record_failure(name, "글 목록을 찾지 못함 (사이트 구조가 바뀌었을 수 있음)")
             continue
+
+        if fails.get(name, 0) >= ALERT_AFTER:
+            send(f"✅ {name}: 다시 정상적으로 확인되고 있어요.")
+        fails.pop(name, None)
 
         if SEND_TEST:
             send("🔔 시험 발송입니다. 가장 최근 글:\n\n" + message(name, posts[0]))
@@ -154,9 +175,9 @@ def main() -> None:
             seen[name] = ([p["id"] for p in new] + seen[name])[:KEEP]
         print(f"{name}: 글 {len(posts)}개 확인, 새 글 {len(new)}개")
 
+    if not fails:
+        seen.pop("_fail", None)
     SEEN_FILE.write_text(json.dumps(seen, ensure_ascii=False, indent=1))
-    if failed:
-        sys.exit(1)
 
 
 if __name__ == "__main__":
